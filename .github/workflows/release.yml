@@ -1,0 +1,55 @@
+name: Release Skill
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: docker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build skill zip
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          SKILL_NAME="avault"
+          ZIP_NAME="${SKILL_NAME}-${VERSION}.zip"
+
+          # Create clean skill package (no .git, no CI files, no README)
+          mkdir -p /tmp/skill-pkg/${SKILL_NAME}
+          cp SKILL.md /tmp/skill-pkg/${SKILL_NAME}/
+          cp -r scripts /tmp/skill-pkg/${SKILL_NAME}/
+          cp -r references /tmp/skill-pkg/${SKILL_NAME}/
+
+          cd /tmp/skill-pkg
+          zip -r /tmp/${ZIP_NAME} ${SKILL_NAME}/
+          echo "Built: ${ZIP_NAME}"
+          ls -lh /tmp/${ZIP_NAME}
+
+      - name: Create release
+        uses: actions/forgejo-release@v2
+        with:
+          direction: upload
+          url: ${{ github.server_url }}
+          repo: ${{ github.repository }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+          tag: ${{ github.ref_name }}
+          title: "${{ github.ref_name }}"
+          release-dir: /tmp/
+          release-notes: |
+            ## avault ${{ github.ref_name }}
+
+            NIP-44 encrypted agent vault with NIP-46 remote signing.
+
+            ### Install
+            1. Download `avault-${{ github.ref_name }}.zip`
+            2. Extract to your agent's `skills/` directory
+            3. Install dependency: `pip install nostr-sdk`
+
+            ### What's included
+            - `SKILL.md` — Agent-facing instructions
+            - `scripts/avault.py` — The vault tool
+            - `references/troubleshooting.md` — Common issues
