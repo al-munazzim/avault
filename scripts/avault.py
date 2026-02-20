@@ -21,8 +21,10 @@ Commands:
   set <name> --key KEY --value VAL     Set a secret
   delete <name>                        Remove a secret
   export [--shell]                     Export all secrets as env vars
-  migrate                              Import secrets from ~/.profile
+  migrate [--dry-run]                  Import secrets from ~/.profile
   audit                                Compare ~/.profile vs vault
+  doctor                               Check prerequisites and config health
+  stale [--days N]                     Flag secrets not rotated in N days (default: 90)
 
 Files (all safe to commit — ciphertext or public info):
   avault.enc      — all secrets, NIP-44 encrypted (self-encrypt with agent nsec)
@@ -39,6 +41,7 @@ import secrets as secrets_mod
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 from datetime import datetime, timezone
@@ -63,6 +66,20 @@ PROFILE_FILE = Path.home() / ".profile"
 _run_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/avault-{os.getuid()}"))
 SOCKET_PATH = Path(os.environ.get("AVAULT_SOCKET", str(_run_dir / "avault.sock")))
 PID_FILE = Path(os.environ.get("AVAULT_PID", str(_run_dir / "avault.pid")))
+
+# Global flag for JSON output (set by --json)
+JSON_OUTPUT = False
+
+
+def output(data, human_fn=None):
+    """Output data as JSON or human-readable."""
+    if JSON_OUTPUT:
+        print(json.dumps(data, indent=2))
+    elif human_fn:
+        human_fn(data)
+    else:
+        print(data)
+
 
 SKIP_VARS = {
     "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "NOSTR_NSEC",
@@ -148,6 +165,29 @@ def save_vault(vault: dict, keys: Keys) -> None:
         keys.secret_key(), keys.public_key(), plaintext, Nip44Version.V2
     )
     VAULT_FILE.write_text(encrypted + "\n")
+    _auto_commit()
+
+
+def _auto_commit() -> None:
+    """Auto-commit and push vault changes (ciphertext only, safe to push)."""
+    try:
+        subprocess.run(
+            ["git", "add", str(VAULT_FILE.name)],
+            cwd=str(WORKSPACE), capture_output=True, timeout=10,
+        )
+        result = subprocess.run(
+            ["git", "commit", "-m", "avault: vault updated"],
+            cwd=str(WORKSPACE), capture_output=True, timeout=10,
+        )
+        if result.returncode == 0:
+            # Push in background to not block the caller
+            subprocess.Popen(
+                ["git", "push", "origin", "main"],
+                cwd=str(WORKSPACE),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass  # non-fatal — vault is saved locally regardless
 
 
 def new_vault() -> dict:
@@ -674,14 +714,18 @@ def cmd_list(_args: argparse.Namespace) -> None:
 
     resp = cli_or_daemon({"cmd": "list"}, fallback)
     data = resp["data"]
-    if not data:
-        print("Vault is empty.")
-        return
-    print(f"{'Name':<20} {'Keys':<30} {'Added':<12} {'Rotated':<12} Note")
-    print("─" * 100)
-    for name, info in data.items():
-        keys_str = ", ".join(info["keys"])
-        print(f"{name:<20} {keys_str:<30} {info['added']:<12} {info['rotated']:<12} {info.get('note', '')}")
+
+    def human(d):
+        if not d:
+            print("Vault is empty.")
+            return
+        print(f"{'Name':<20} {'Keys':<30} {'Added':<12} {'Rotated':<12} Note")
+        print("─" * 100)
+        for name, info in d.items():
+            keys_str = ", ".join(info["keys"])
+            print(f"{name:<20} {keys_str:<30} {info['added']:<12} {info['rotated']:<12} {info.get('note', '')}")
+
+    output(data, human)
 
 
 def cmd_get(args: argparse.Namespace) -> None:
@@ -707,11 +751,15 @@ def cmd_get(args: argparse.Namespace) -> None:
         req["key"] = args.key
     resp = cli_or_daemon(req, fallback)
     data = resp["data"]
-    if isinstance(data, str):
-        print(data)
-    else:
-        for k, v in data.items():
-            print(f"{k}={v}")
+
+    def human(d):
+        if isinstance(d, str):
+            print(d)
+        else:
+            for k, v in d.items():
+                print(f"{k}={v}")
+
+    output(data, human)
 
 
 def cmd_set(args: argparse.Namespace) -> None:
@@ -781,7 +829,9 @@ def cmd_export(args: argparse.Namespace) -> None:
             print(f"{k}={v}")
 
 
-def cmd_migrate(_args: argparse.Namespace) -> None:
+def cmd_migrate(args: argparse.Namespace) -> None:
+    dry_run = getattr(args, "dry_run", False)
+
     # Migrate always needs local keys (it's a setup operation)
     keys = get_keys()
     if not keys:
@@ -794,21 +844,34 @@ def cmd_migrate(_args: argparse.Namespace) -> None:
     groups = group_exports(exports)
 
     migrated = 0
+    results = []
     for group, values in groups.items():
         if group in vault["secrets"]:
+            results.append({"group": group, "status": "skipped", "reason": "already in vault"})
             print(f"⏭  {group}: already in vault, skipping")
             continue
-        vault["secrets"][group] = {
-            "values": values,
-            "added": today(),
-            "rotated": today(),
-            "note": "Migrated from ~/.profile",
-        }
-        print(f"✓  {group}: {', '.join(values.keys())}")
+        if dry_run:
+            results.append({"group": group, "status": "would_migrate", "keys": list(values.keys())})
+            print(f"🔍 {group}: would migrate {', '.join(values.keys())}")
+        else:
+            vault["secrets"][group] = {
+                "values": values,
+                "added": today(),
+                "rotated": today(),
+                "note": "Migrated from ~/.profile",
+            }
+            results.append({"group": group, "status": "migrated", "keys": list(values.keys())})
+            print(f"✓  {group}: {', '.join(values.keys())}")
         migrated += 1
 
-    save_vault(vault, keys)
-    print(f"\nMigrated {migrated} secret group(s). Vault re-encrypted.")
+    if not dry_run:
+        save_vault(vault, keys)
+        print(f"\nMigrated {migrated} secret group(s). Vault re-encrypted.")
+    else:
+        print(f"\n[DRY RUN] Would migrate {migrated} secret group(s). No changes made.")
+
+    if JSON_OUTPUT:
+        output({"migrated": migrated, "dry_run": dry_run, "groups": results})
 
 
 def cmd_audit(_args: argparse.Namespace) -> None:
@@ -827,17 +890,194 @@ def cmd_audit(_args: argparse.Namespace) -> None:
     not_in_vault = [k for k in profile_keys if k not in vault_keys]
     only_in_vault = [k for k in vault_keys if k not in profile_keys]
 
-    if not not_in_vault and not only_in_vault:
-        print("✓ All secrets in sync.")
+    result = {
+        "in_sync": not not_in_vault and not only_in_vault,
+        "only_in_profile": not_in_vault,
+        "only_in_vault": only_in_vault,
+    }
+
+    def human(r):
+        if r["in_sync"]:
+            print("✓ All secrets in sync.")
+        else:
+            if r["only_in_profile"]:
+                print("In ~/.profile but NOT in vault:")
+                for k in r["only_in_profile"]:
+                    print(f"  ⚠  {k}")
+            if r["only_in_vault"]:
+                print("\nIn vault but NOT in ~/.profile:")
+                for k in r["only_in_vault"]:
+                    print(f"  ℹ  {k}")
+
+    output(result, human)
+
+
+def cmd_doctor(_args: argparse.Namespace) -> None:
+    """Check prerequisites and config health."""
+    checks = []
+
+    # 1. nostr-sdk importable
+    try:
+        import nostr_sdk  # noqa: F401
+        checks.append({"check": "nostr-sdk", "ok": True, "detail": "installed"})
+    except ImportError:
+        checks.append({"check": "nostr-sdk", "ok": False, "detail": "pip install nostr-sdk"})
+
+    # 2. nsec available
+    nsec = get_nsec_string()
+    checks.append({
+        "check": "nsec",
+        "ok": bool(nsec),
+        "detail": "found in env/profile" if nsec else "not found (set NOSTR_NSEC or add to ~/.profile)",
+    })
+
+    # 3. Vault file exists
+    checks.append({
+        "check": "avault.enc",
+        "ok": VAULT_FILE.exists(),
+        "detail": str(VAULT_FILE) if VAULT_FILE.exists() else "not found — run: avault init",
+    })
+
+    # 4. nsec.enc exists
+    checks.append({
+        "check": "nsec.enc",
+        "ok": NSEC_ENC_FILE.exists(),
+        "detail": str(NSEC_ENC_FILE) if NSEC_ENC_FILE.exists() else "not found — run: avault init",
+    })
+
+    # 5. nip46.json exists and valid
+    nip46_ok = False
+    nip46_detail = "not found"
+    if NIP46_FILE.exists():
+        try:
+            cfg = json.loads(NIP46_FILE.read_text())
+            if cfg.get("signer_npub") and cfg.get("agent_npub"):
+                nip46_ok = True
+                nip46_detail = f"signer={cfg['signer_npub'][:20]}..."
+            else:
+                nip46_detail = "missing signer_npub or agent_npub"
+        except json.JSONDecodeError:
+            nip46_detail = "invalid JSON"
+    checks.append({"check": "nip46.json", "ok": nip46_ok, "detail": nip46_detail})
+
+    # 6. Vault decryptable (only if nsec + vault exist)
+    if nsec and VAULT_FILE.exists():
+        try:
+            keys = Keys.parse(nsec)
+            v = load_vault(keys)
+            if v:
+                checks.append({
+                    "check": "vault_decrypt",
+                    "ok": True,
+                    "detail": f"{len(v['secrets'])} secret(s), version {v.get('version', '?')}",
+                })
+            else:
+                checks.append({"check": "vault_decrypt", "ok": False, "detail": "decrypt returned None"})
+        except Exception as e:
+            checks.append({"check": "vault_decrypt", "ok": False, "detail": str(e)})
     else:
-        if not_in_vault:
-            print("In ~/.profile but NOT in vault:")
-            for k in not_in_vault:
-                print(f"  ⚠  {k}")
-        if only_in_vault:
-            print("\nIn vault but NOT in ~/.profile:")
-            for k in only_in_vault:
-                print(f"  ℹ  {k}")
+        checks.append({"check": "vault_decrypt", "ok": False, "detail": "skipped (no nsec or vault)"})
+
+    # 7. Daemon running
+    if daemon_running():
+        resp = daemon_request({"cmd": "status"})
+        checks.append({
+            "check": "daemon",
+            "ok": resp.get("ok", False),
+            "detail": f"{resp['data']['secrets_count']} secret(s) in RAM" if resp.get("ok") else resp.get("error", "not responding"),
+        })
+    else:
+        checks.append({"check": "daemon", "ok": False, "detail": "not running"})
+
+    # 8. Git repo (for auto-commit)
+    git_ok = (WORKSPACE / ".git").is_dir()
+    checks.append({
+        "check": "git_repo",
+        "ok": git_ok,
+        "detail": "workspace is a git repo" if git_ok else "no .git — auto-commit won't work",
+    })
+
+    # Output
+    all_ok = all(c["ok"] for c in checks)
+
+    def human(cs):
+        for c in cs:
+            icon = "✅" if c["ok"] else "❌"
+            print(f"  {icon} {c['check']:<20} {c['detail']}")
+        print()
+        if all_ok:
+            print("All checks passed. ✓")
+        else:
+            failed = sum(1 for c in cs if not c["ok"])
+            print(f"{failed} check(s) need attention.")
+
+    output({"checks": checks, "all_ok": all_ok}, lambda d: human(d["checks"]))
+
+    if not all_ok:
+        sys.exit(1)
+
+
+def cmd_stale(args: argparse.Namespace) -> None:
+    """Flag secrets not rotated within threshold."""
+    days = args.days
+
+    def get_vault():
+        if daemon_running():
+            resp = daemon_request({"cmd": "list"})
+            if resp.get("ok"):
+                return resp["data"]
+        keys = get_keys()
+        if not keys:
+            sys.exit("No nsec found and daemon not running.")
+        vault = load_vault(keys)
+        if not vault:
+            sys.exit("No avault.enc found.")
+        return {
+            name: {
+                "keys": list(e.get("values", {}).keys()),
+                "added": e.get("added", "-"),
+                "rotated": e.get("rotated", "-"),
+                "note": e.get("note", ""),
+            }
+            for name, e in vault["secrets"].items()
+        }
+
+    data = get_vault()
+    today_dt = datetime.now(timezone.utc).date()
+    stale = []
+    fresh = []
+
+    for name, info in data.items():
+        rotated = info.get("rotated", info.get("added", "-"))
+        if rotated == "-":
+            stale.append({"name": name, "rotated": rotated, "age_days": None})
+            continue
+        try:
+            rot_date = datetime.strptime(rotated, "%Y-%m-%d").date()
+            age = (today_dt - rot_date).days
+            if age > days:
+                stale.append({"name": name, "rotated": rotated, "age_days": age})
+            else:
+                fresh.append({"name": name, "rotated": rotated, "age_days": age})
+        except ValueError:
+            stale.append({"name": name, "rotated": rotated, "age_days": None})
+
+    result = {"threshold_days": days, "stale": stale, "fresh": fresh}
+
+    def human(r):
+        if r["stale"]:
+            print(f"⚠  Secrets not rotated in {r['threshold_days']}+ days:")
+            for s in r["stale"]:
+                age_str = f"{s['age_days']}d ago" if s["age_days"] is not None else "unknown"
+                print(f"  🔴 {s['name']:<20} rotated: {s['rotated']:<12} ({age_str})")
+        else:
+            print(f"✅ All secrets rotated within {r['threshold_days']} days.")
+        if r["fresh"]:
+            print(f"\n  Fresh ({len(r['fresh'])}):")
+            for s in r["fresh"]:
+                print(f"  🟢 {s['name']:<20} rotated: {s['rotated']:<12} ({s['age_days']}d ago)")
+
+    output(result, human)
 
 
 # --- CLI ---
@@ -847,6 +1087,7 @@ def main():
         prog="avault",
         description="Agent Vault — NIP-44 encrypted secrets with NIP-46 remote signing",
     )
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
     sub = parser.add_subparsers(dest="command")
 
     # daemon
@@ -893,15 +1134,27 @@ def main():
     p_export.add_argument("--shell", action="store_true", help="Output as shell export statements")
 
     # migrate
-    sub.add_parser("migrate", help="Import secrets from ~/.profile")
+    p_migrate = sub.add_parser("migrate", help="Import secrets from ~/.profile")
+    p_migrate.add_argument("--dry-run", action="store_true", help="Show what would be migrated without making changes")
 
     # audit
     sub.add_parser("audit", help="Compare ~/.profile vs vault")
+
+    # doctor
+    sub.add_parser("doctor", help="Check prerequisites and config health")
+
+    # stale
+    p_stale = sub.add_parser("stale", help="Flag secrets not rotated recently")
+    p_stale.add_argument("--days", type=int, default=90, help="Staleness threshold in days (default: 90)")
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
+    # Set global JSON flag
+    global JSON_OUTPUT
+    JSON_OUTPUT = getattr(args, "json", False)
 
     # Handle --background flag for daemon start
     if args.command == "daemon" and getattr(args, "background", False):
@@ -918,6 +1171,8 @@ def main():
         "export": cmd_export,
         "migrate": cmd_migrate,
         "audit": cmd_audit,
+        "doctor": cmd_doctor,
+        "stale": cmd_stale,
     }
     commands[args.command](args)
 
