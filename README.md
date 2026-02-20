@@ -6,6 +6,26 @@ Your phone becomes the hardware key for your AI agent's secrets. Secrets live in
 
 ---
 
+## Table of Contents
+
+- [The Problem](#the-problem)
+- [The Solution](#the-solution)
+- [Quick Start](#quick-start)
+- [Commands](#commands)
+- [How It Works](#how-it-works)
+  - [Encryption](#encryption)
+  - [NIP-46 Remote Signing](#nip-46-remote-signing)
+  - [Unix Socket Protocol](#unix-socket-protocol)
+  - [Auto-commit](#auto-commit)
+- [Security Model](#security-model)
+- [As an OpenClaw Skill](#as-an-openclaw-skill)
+- [Integration Examples](#integration-examples)
+- [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
+
 ## The Problem
 
 AI agents need API keys, tokens, and credentials. Today, most agents store them in:
