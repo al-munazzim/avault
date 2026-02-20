@@ -47,6 +47,12 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import qrcode
+    HAS_QRCODE = True
+except ImportError:
+    HAS_QRCODE = False
+
 from nostr_sdk import (
     Keys,
     Nip44Version,
@@ -79,6 +85,33 @@ def output(data, human_fn=None):
         human_fn(data)
     else:
         print(data)
+
+
+def _print_qr(data: str) -> None:
+    """Print QR code to terminal. Falls back to plain text if qrcode not installed."""
+    if not HAS_QRCODE:
+        print(f"   (install 'qrcode' package for QR display: pip install qrcode)")
+        return
+    qr = qrcode.QRCode(border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+    qr.add_data(data)
+    qr.make(fit=True)
+    # Print using Unicode half-blocks for compact terminal display
+    matrix = qr.get_matrix()
+    # Each pair of rows → one line using ▀ ▄ █ and space
+    for r in range(0, len(matrix), 2):
+        line = []
+        for c in range(len(matrix[r])):
+            top = matrix[r][c]
+            bot = matrix[r + 1][c] if r + 1 < len(matrix) else False
+            if top and bot:
+                line.append("█")
+            elif top:
+                line.append("▀")
+            elif bot:
+                line.append("▄")
+            else:
+                line.append(" ")
+        print("   " + "".join(line))
 
 
 SKIP_VARS = {
@@ -284,6 +317,7 @@ class VaultDaemon:
 
         signer_hex = PublicKey.parse(nip46_config["signer_npub"]).to_hex()
         relay = nip46_config.get("relay", DEFAULT_RELAY)
+        agent_name = nip46_config.get("agent_name", "avault")
 
         # Use a fresh secret to force clean NIP-46 handshake.
         secret = secrets_mod.token_hex(16)
@@ -300,11 +334,20 @@ class VaultDaemon:
         nsec = get_nsec_string()
         if nsec:
             app_keys = Keys.parse(nsec)
-            print(f"⏳ Connecting to signer via NIP-46 (known identity)...")
+            print(f"⏳ Connecting to signer via NIP-46 (known identity: {agent_name})...")
         else:
             app_keys = Keys.generate()
             print(f"⏳ Connecting to signer via NIP-46 (ephemeral identity)...")
             print(f"   ⚠️  New app key — approve in your signer!")
+
+            # Show QR code for operator to scan with Amber
+            # nostrconnect:// URI for the operator to initiate pairing
+            app_pubhex = app_keys.public_key().to_hex()
+            connect_uri = f"nostrconnect://{app_pubhex}?relay={relay}&secret={secret}&metadata=%7B%22name%22%3A%22{agent_name}%22%7D"
+            print(f"\n📱 Scan this QR code with your Nostr signer (Amber):\n")
+            _print_qr(connect_uri)
+            print(f"\n   Or paste this URI manually:")
+            print(f"   {connect_uri}\n")
 
         nc = NostrConnect(uri, app_keys, timedelta(seconds=timeout_secs), None)
 
@@ -658,9 +701,11 @@ def cmd_init(args: argparse.Namespace) -> None:
         print("avault.enc created (empty vault)")
 
     # Save NIP-46 connection config (no secret — pairing is done via QR/approve in signer)
+    agent_name = getattr(args, "agent_name", None) or "avault"
     nip46_config = {
         "signer_npub": args.signer_npub,
         "agent_npub": keys.public_key().to_bech32(),
+        "agent_name": agent_name,
         "relay": DEFAULT_RELAY,
     }
     NIP46_FILE.write_text(json.dumps(nip46_config, indent=2) + "\n")
@@ -1106,6 +1151,7 @@ def main():
     # init
     p_init = sub.add_parser("init", help="Initialize vault")
     p_init.add_argument("--signer-npub", required=True, help="Operator's npub")
+    p_init.add_argument("--agent-name", default="avault", help="Agent name shown in signer (default: avault)")
 
     # unlock
     sub.add_parser("unlock", help="Verify vault access")
