@@ -839,7 +839,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"config.json created")
 
     # Create empty secrets.central
-    save_central_manifest(new_vault() if not VAULT_FILE.exists() else load_vault(keys) or new_vault(), keys, owner_pubkey)
+    vault = load_vault(keys) if VAULT_FILE.exists() else None
+    save_central_manifest(vault or new_vault(), keys, owner_pubkey)
     print(f"secrets.central created")
 
     agent_npub = keys.public_key().to_bech32()
@@ -1285,9 +1286,19 @@ def cmd_stale(args: argparse.Namespace) -> None:
     output(result, human)
 
 
+def _read_owner_nsec(args) -> str:
+    """Read owner nsec from --owner-nsec arg or stdin (if '-')."""
+    nsec = args.owner_nsec
+    if nsec == "-":
+        nsec = sys.stdin.readline().strip()
+    if not nsec:
+        sys.exit("No owner nsec provided.")
+    return nsec
+
+
 def cmd_fleet_audit(args: argparse.Namespace) -> None:
     """Decrypt secrets.central metadata with owner's nsec (no secret values)."""
-    owner_keys = Keys.parse(args.owner_nsec)
+    owner_keys = Keys.parse(_read_owner_nsec(args))
     repo = Path(args.repo).resolve()
     avault_dir = repo / ".avault"
     config_file = avault_dir / "config.json"
@@ -1320,7 +1331,8 @@ def cmd_fleet_audit(args: argparse.Namespace) -> None:
 
 def cmd_fleet_recover(args: argparse.Namespace) -> None:
     """Recover agent nsec and optionally full vault with owner's nsec."""
-    owner_keys = Keys.parse(args.owner_nsec)
+    print("⚠️  WARNING: This outputs sensitive key material to stdout.", file=sys.stderr)
+    owner_keys = Keys.parse(_read_owner_nsec(args))
     repo = Path(args.repo).resolve()
     avault_dir = repo / ".avault"
     config_file = avault_dir / "config.json"
@@ -1433,12 +1445,12 @@ def main():
 
     # fleet-audit
     p_faudit = sub.add_parser("fleet-audit", help="Decrypt secrets.central metadata (owner-side)")
-    p_faudit.add_argument("--owner-nsec", required=True, help="Owner's nsec for decryption")
+    p_faudit.add_argument("--owner-nsec", required=True, help="Owner's nsec (or '-' to read from stdin)")
     p_faudit.add_argument("--repo", default=".", help="Path to workspace (default: .)")
 
     # fleet-recover
     p_frecover = sub.add_parser("fleet-recover", help="Recover agent nsec + vault (owner-side)")
-    p_frecover.add_argument("--owner-nsec", required=True, help="Owner's nsec for decryption")
+    p_frecover.add_argument("--owner-nsec", required=True, help="Owner's nsec (or '-' to read from stdin)")
     p_frecover.add_argument("--repo", default=".", help="Path to workspace (default: .)")
     p_frecover.add_argument("--full", action="store_true", help="Also decrypt full vault secrets")
 

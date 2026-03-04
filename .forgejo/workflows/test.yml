@@ -8,15 +8,13 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    runs-on: python-${{ matrix.python-version }}
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: pip install --no-cache-dir nostr-sdk pytest qrcode
