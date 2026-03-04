@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-avault — Agent Vault: NIP-44 encrypted secret management with NIP-46 remote signing.
+avault — Agent Vault: NIP-44 encrypted secret management with unified owner model.
 
 Architecture:
   avault daemon   — long-running process, holds secrets in RAM only
-                    connects to Amber/signer via NIP-46 on startup
+                    tries NOSTR_NSEC env → ~/.profile → NIP-46 to owner
                     listens on unix socket for CLI requests
   avault <cmd>    — short-lived CLI, talks to daemon via socket
                     (falls back to local nsec if daemon not running)
 
 Commands:
-  daemon start [--foreground]          Start daemon (NIP-46 → Amber → decrypt → serve)
+  daemon start [--foreground]          Start daemon (env/profile nsec → NIP-46 fallback)
   daemon stop                          Stop daemon, wipe secrets from RAM
   daemon status                        Check if daemon is running
 
-  init --signer-npub <npub>            Initialize vault + encrypt nsec for operator
+  init --owner-npub <npub>             Initialize vault + encrypt nsec for owner
   unlock                               Decrypt vault, verify access
   list                                 List secret names + metadata
   get <name> [--key KEY]               Get a secret value
@@ -25,11 +25,14 @@ Commands:
   audit                                Compare ~/.profile vs vault
   doctor                               Check prerequisites and config health
   stale [--days N]                     Flag secrets not rotated in N days (default: 90)
+  fleet-audit --owner-nsec <nsec>      Decrypt secrets.central metadata (no values)
+  fleet-recover --owner-nsec <nsec>    Recover agent nsec + optionally full vault
 
-Files (all safe to commit — ciphertext or public info):
-  avault.enc      — all secrets, NIP-44 encrypted (self-encrypt with agent nsec)
-  nsec.enc        — agent's nsec, NIP-44 encrypted with operator's npub
-  nip46.json      — NIP-46 connection info (signer npub, relay — public data)
+Files (all in .avault/, safe to commit — ciphertext or public info):
+  .avault/config.json      — {owner_npub, agent_npub, agent_name, relay}
+  .avault/nsec.enc         — agent nsec encrypted TO owner_npub
+  .avault/secrets.vault    — secrets encrypted with agent keys (self-encrypt)
+  .avault/secrets.central  — secret names+metadata encrypted TO owner_npub (no values)
 """
 
 import argparse
@@ -65,10 +68,16 @@ from nostr_sdk import (
 
 # --- Config ---
 WORKSPACE = Path(os.environ.get("WORKSPACE", Path.home() / "clawd"))
-VAULT_FILE = WORKSPACE / "avault.enc"
-NSEC_ENC_FILE = WORKSPACE / "nsec.enc"
-NIP46_FILE = WORKSPACE / "nip46.json"
+AVAULT_DIR = WORKSPACE / ".avault"
+VAULT_FILE = AVAULT_DIR / "secrets.vault"
+NSEC_ENC_FILE = AVAULT_DIR / "nsec.enc"
+CONFIG_FILE = AVAULT_DIR / "config.json"
+CENTRAL_FILE = AVAULT_DIR / "secrets.central"
 PROFILE_FILE = Path.home() / ".profile"
+# Legacy paths (for auto-migration)
+_LEGACY_VAULT = WORKSPACE / "avault.enc"
+_LEGACY_NSEC_ENC = WORKSPACE / "nsec.enc"
+_LEGACY_NIP46 = WORKSPACE / "nip46.json"
 _run_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/avault-{os.getuid()}"))
 SOCKET_PATH = Path(os.environ.get("AVAULT_SOCKET", str(_run_dir / "avault.sock")))
 PID_FILE = Path(os.environ.get("AVAULT_PID", str(_run_dir / "avault.pid")))
@@ -184,6 +193,13 @@ def get_keys() -> Keys | None:
     return Keys.parse(nsec)
 
 
+def load_config() -> dict | None:
+    """Load .avault/config.json."""
+    if not CONFIG_FILE.exists():
+        return None
+    return json.loads(CONFIG_FILE.read_text())
+
+
 def load_vault(keys: Keys) -> dict | None:
     if not VAULT_FILE.exists():
         return None
@@ -192,12 +208,43 @@ def load_vault(keys: Keys) -> dict | None:
     return json.loads(plaintext)
 
 
-def save_vault(vault: dict, keys: Keys) -> None:
+def _build_central_manifest(vault: dict) -> dict:
+    """Build metadata-only manifest from vault (no secret values)."""
+    secrets_meta = {}
+    for name, entry in vault.get("secrets", {}).items():
+        secrets_meta[name] = {
+            "keys": list(entry.get("values", {}).keys()),
+            "added": entry.get("added", ""),
+            "rotated": entry.get("rotated", ""),
+            "note": entry.get("note", ""),
+        }
+    return {"version": 1, "secrets": secrets_meta}
+
+
+def save_central_manifest(vault: dict, keys: Keys, owner_pk: PublicKey) -> None:
+    """Encrypt central manifest TO owner_npub, write .avault/secrets.central."""
+    manifest = _build_central_manifest(vault)
+    plaintext = json.dumps(manifest, indent=2)
+    encrypted = nip44_encrypt(
+        keys.secret_key(), owner_pk, plaintext, Nip44Version.V2
+    )
+    CENTRAL_FILE.write_text(encrypted + "\n")
+
+
+def save_vault(vault: dict, keys: Keys, owner_pk: PublicKey | None = None) -> None:
+    AVAULT_DIR.mkdir(parents=True, exist_ok=True)
     plaintext = json.dumps(vault, indent=2)
     encrypted = nip44_encrypt(
         keys.secret_key(), keys.public_key(), plaintext, Nip44Version.V2
     )
     VAULT_FILE.write_text(encrypted + "\n")
+    # Write secrets.central if owner_pk available
+    if owner_pk is None:
+        config = load_config()
+        if config and config.get("owner_npub"):
+            owner_pk = PublicKey.parse(config["owner_npub"])
+    if owner_pk:
+        save_central_manifest(vault, keys, owner_pk)
     _auto_commit()
 
 
@@ -205,7 +252,7 @@ def _auto_commit() -> None:
     """Auto-commit and push vault changes (ciphertext only, safe to push)."""
     try:
         subprocess.run(
-            ["git", "add", str(VAULT_FILE.name)],
+            ["git", "add", ".avault/"],
             cwd=str(WORKSPACE), capture_output=True, timeout=10,
         )
         result = subprocess.run(
@@ -213,7 +260,6 @@ def _auto_commit() -> None:
             cwd=str(WORKSPACE), capture_output=True, timeout=10,
         )
         if result.returncode == 0:
-            # Push in background to not block the caller
             subprocess.Popen(
                 ["git", "push", "origin", "main"],
                 cwd=str(WORKSPACE),
@@ -229,6 +275,78 @@ def new_vault() -> dict:
         "created": datetime.now(timezone.utc).isoformat(),
         "secrets": {},
     }
+
+
+def auto_migrate_layout() -> bool:
+    """Migrate old flat-file layout to .avault/ directory. Returns True if migrated."""
+    if AVAULT_DIR.exists():
+        return False
+    has_legacy = _LEGACY_VAULT.exists() or _LEGACY_NSEC_ENC.exists() or _LEGACY_NIP46.exists()
+    if not has_legacy:
+        return False
+
+    print("Migrating to .avault/ directory layout...")
+    AVAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if _LEGACY_VAULT.exists():
+        VAULT_FILE.write_text(_LEGACY_VAULT.read_text())
+        _LEGACY_VAULT.unlink()
+        print(f"  avault.enc -> .avault/secrets.vault")
+
+    if _LEGACY_NSEC_ENC.exists():
+        NSEC_ENC_FILE.write_text(_LEGACY_NSEC_ENC.read_text())
+        _LEGACY_NSEC_ENC.unlink()
+        print(f"  nsec.enc -> .avault/nsec.enc")
+
+    if _LEGACY_NIP46.exists():
+        old_config = json.loads(_LEGACY_NIP46.read_text())
+        # Rename signer_npub -> owner_npub
+        new_config = {
+            "owner_npub": old_config.get("signer_npub", old_config.get("owner_npub", "")),
+            "agent_npub": old_config.get("agent_npub", ""),
+            "agent_name": old_config.get("agent_name", "avault"),
+            "relay": old_config.get("relay", DEFAULT_RELAY),
+        }
+        CONFIG_FILE.write_text(json.dumps(new_config, indent=2) + "\n")
+        _LEGACY_NIP46.unlink()
+        print(f"  nip46.json -> .avault/config.json (signer_npub -> owner_npub)")
+
+    # Generate secrets.central if we have vault + config
+    if VAULT_FILE.exists() and CONFIG_FILE.exists():
+        config = load_config()
+        nsec = get_nsec_string()
+        if nsec and config and config.get("owner_npub"):
+            try:
+                keys = Keys.parse(nsec)
+                vault = load_vault(keys)
+                if vault:
+                    owner_pk = PublicKey.parse(config["owner_npub"])
+                    save_central_manifest(vault, keys, owner_pk)
+                    print(f"  Generated .avault/secrets.central")
+            except Exception:
+                pass  # non-fatal
+
+    # Auto-commit migration
+    try:
+        # Remove old files from git
+        for f in [_LEGACY_VAULT, _LEGACY_NSEC_ENC, _LEGACY_NIP46]:
+            subprocess.run(
+                ["git", "rm", "--cached", "-f", f.name],
+                cwd=str(WORKSPACE), capture_output=True, timeout=10,
+            )
+        subprocess.run(
+            ["git", "add", ".avault/"],
+            cwd=str(WORKSPACE), capture_output=True, timeout=10,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "avault: migrate to .avault/ directory layout"],
+            cwd=str(WORKSPACE), capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+    print("Migration complete.\n")
+    return True
 
 
 def today() -> str:
@@ -308,16 +426,18 @@ class VaultDaemon:
     def __init__(self):
         self.keys: Keys | None = None         # agent's keys (from nsec)
         self.vault: dict | None = None         # decrypted vault
+        self.owner_pk: PublicKey | None = None # owner's public key
         self.running = False
         self.server_sock: socket.socket | None = None
 
-    async def start_nip46(self, nip46_config: dict, timeout_secs: int = 120) -> Keys:
-        """Connect to signer via NIP-46, decrypt nsec.enc, return agent Keys."""
+    async def start_nip46(self, config: dict, timeout_secs: int = 120) -> Keys:
+        """Connect to owner via NIP-46, decrypt nsec.enc, return agent Keys."""
         from datetime import timedelta
 
-        signer_hex = PublicKey.parse(nip46_config["signer_npub"]).to_hex()
-        relay = nip46_config.get("relay", DEFAULT_RELAY)
-        agent_name = nip46_config.get("agent_name", "avault")
+        owner_npub = config.get("owner_npub", config.get("signer_npub", ""))
+        signer_hex = PublicKey.parse(owner_npub).to_hex()
+        relay = config.get("relay", DEFAULT_RELAY)
+        agent_name = config.get("agent_name", "avault")
 
         # Use a fresh secret to force clean NIP-46 handshake.
         secret = secrets_mod.token_hex(16)
@@ -352,7 +472,7 @@ class VaultDaemon:
         nc = NostrConnect(uri, app_keys, timedelta(seconds=timeout_secs), None)
 
         print(f"   Relay: {relay}")
-        print(f"   Signer: {nip46_config['signer_npub']}")
+        print(f"   Owner: {owner_npub}")
 
         # get_public_key() triggers the connect handshake.
         # Already-paired signers (Amber) may respond "ack" — that's fine.
@@ -381,9 +501,9 @@ class VaultDaemon:
         # But we don't know agent_pk yet (that's what we're trying to recover!)
         #
         # Solution: store agent_npub in nip46.json (it's public info)
-        agent_npub = nip46_config.get("agent_npub")
+        agent_npub = config.get("agent_npub")
         if not agent_npub:
-            raise ValueError("agent_npub missing from nip46.json — needed to decrypt nsec.enc")
+            raise ValueError("agent_npub missing from config.json — needed to decrypt nsec.enc")
 
         agent_pk = PublicKey.parse(agent_npub)
         nsec_str = await nc.nip44_decrypt(agent_pk, nsec_ciphertext)
@@ -397,7 +517,7 @@ class VaultDaemon:
             raise RuntimeError("No keys loaded")
         self.vault = load_vault(self.keys)
         if not self.vault:
-            raise FileNotFoundError("No avault.enc found")
+            raise FileNotFoundError("No secrets.vault found")
         count = len(self.vault["secrets"])
         print(f"✅ Vault decrypted: {count} secret(s) in RAM")
 
@@ -461,8 +581,7 @@ class VaultDaemon:
             self.vault["secrets"][name]["rotated"] = today()
             if note:
                 self.vault["secrets"][name]["note"] = note
-            # Re-encrypt and save to disk
-            save_vault(self.vault, self.keys)
+            save_vault(self.vault, self.keys, self.owner_pk)
             return {"ok": True, "data": f"Set {name}.{key}"}
 
         if cmd == "delete":
@@ -472,7 +591,7 @@ class VaultDaemon:
             if name not in self.vault["secrets"]:
                 return {"ok": False, "error": f'Secret "{name}" not found'}
             del self.vault["secrets"][name]
-            save_vault(self.vault, self.keys)
+            save_vault(self.vault, self.keys, self.owner_pk)
             return {"ok": True, "data": f'Deleted "{name}"'}
 
         if cmd == "export":
@@ -553,29 +672,34 @@ class VaultDaemon:
 
 
 async def daemon_start(foreground: bool = True, timeout: int = 120) -> None:
-    """Start the vault daemon with NIP-46 unlock."""
+    """Start the vault daemon with unified nsec fallback."""
+    auto_migrate_layout()
+
     if daemon_running():
-        # Check if actually alive
         resp = daemon_request({"cmd": "status"})
         if resp.get("ok"):
             print("Daemon already running.")
             return
-        # Stale socket
         SOCKET_PATH.unlink()
 
-    # Load NIP-46 config
-    if not NIP46_FILE.exists():
+    # Load config
+    config = load_config()
+    if not config:
         sys.exit(
-            f"No {NIP46_FILE} found. Run 'avault init --signer-npub <npub>' first,\n"
-            "then 'avault nip46-setup' to configure the connection."
+            f"No {CONFIG_FILE} found. Run 'avault init --owner-npub <npub>' first."
         )
 
-    nip46_config = json.loads(NIP46_FILE.read_text())
-
     daemon = VaultDaemon()
+    daemon.owner_pk = PublicKey.parse(config["owner_npub"]) if config.get("owner_npub") else None
 
-    # Connect to signer and get keys
-    daemon.keys = await daemon.start_nip46(nip46_config, timeout_secs=timeout)
+    # Unified fallback: env var -> profile -> NIP-46
+    nsec = get_nsec_string()
+    if nsec:
+        daemon.keys = Keys.parse(nsec)
+        print(f"Using nsec from {'env' if os.environ.get('NOSTR_NSEC') else 'profile'}")
+    else:
+        # NIP-46 flow to owner
+        daemon.keys = await daemon.start_nip46(config, timeout_secs=timeout)
 
     # Decrypt vault
     daemon.decrypt_vault()
@@ -671,7 +795,7 @@ def cmd_daemon(args: argparse.Namespace) -> None:
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    signer_pubkey = PublicKey.parse(args.signer_npub)
+    owner_pubkey = PublicKey.parse(args.owner_npub)
 
     keys = get_keys()
     nsec_str = get_nsec_string()
@@ -686,40 +810,47 @@ def cmd_init(args: argparse.Namespace) -> None:
             f.write(f'\nexport NOSTR_NSEC="{nsec_str}"\n')
         print("New keypair generated. nsec written to ~/.profile")
 
-    # Encrypt nsec with operator's pubkey
+    # Create .avault/ directory
+    AVAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Encrypt nsec with owner's pubkey
     nsec_encrypted = nip44_encrypt(
-        keys.secret_key(), signer_pubkey, nsec_str, Nip44Version.V2
+        keys.secret_key(), owner_pubkey, nsec_str, Nip44Version.V2
     )
     NSEC_ENC_FILE.write_text(nsec_encrypted + "\n")
-    print("nsec.enc created (encrypted to operator's npub)")
+    print("nsec.enc created (encrypted to owner's npub)")
 
     # Create empty vault if needed
     if VAULT_FILE.exists():
-        print("avault.enc already exists. Skipping vault creation.")
+        print("secrets.vault already exists. Skipping vault creation.")
     else:
-        save_vault(new_vault(), keys)
-        print("avault.enc created (empty vault)")
+        save_vault(new_vault(), keys, owner_pubkey)
+        print("secrets.vault created (empty vault)")
 
-    # Save NIP-46 connection config (no secret — pairing is done via QR/approve in signer)
+    # Write config.json
     agent_name = getattr(args, "agent_name", None) or "avault"
-    nip46_config = {
-        "signer_npub": args.signer_npub,
+    config = {
+        "owner_npub": args.owner_npub,
         "agent_npub": keys.public_key().to_bech32(),
         "agent_name": agent_name,
         "relay": DEFAULT_RELAY,
     }
-    NIP46_FILE.write_text(json.dumps(nip46_config, indent=2) + "\n")
-    print(f"nip46.json created (connection config)")
+    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+    print(f"config.json created")
+
+    # Create empty secrets.central
+    save_central_manifest(new_vault() if not VAULT_FILE.exists() else load_vault(keys) or new_vault(), keys, owner_pubkey)
+    print(f"secrets.central created")
 
     agent_npub = keys.public_key().to_bech32()
-    print(f"\nAgent npub:    {agent_npub}")
-    print(f"Operator npub: {args.signer_npub}")
-    print(f"\nFiles created:")
-    print(f"  {VAULT_FILE}    (ciphertext)")
-    print(f"  {NSEC_ENC_FILE}      (ciphertext)")
-    print(f"  {NIP46_FILE}     (public config)")
+    print(f"\nAgent npub:  {agent_npub}")
+    print(f"Owner npub:  {args.owner_npub}")
+    print(f"\nFiles created in {AVAULT_DIR}/:")
+    print(f"  config.json      (public config)")
+    print(f"  nsec.enc         (ciphertext)")
+    print(f"  secrets.vault    (ciphertext)")
+    print(f"  secrets.central  (ciphertext)")
     print(f"\nNext: start daemon with 'avault daemon start'")
-    print(f"      (operator scans QR or approves in Amber)")
 
 
 def cmd_unlock(_args: argparse.Namespace) -> None:
@@ -735,7 +866,7 @@ def cmd_unlock(_args: argparse.Namespace) -> None:
         sys.exit("No nsec found and daemon not running.")
     vault = load_vault(keys)
     if not vault:
-        sys.exit("No avault.enc found.")
+        sys.exit("No secrets.vault found.")
     print(f"Vault unlocked. Version {vault['version']}, {len(vault['secrets'])} secret(s).")
 
 
@@ -746,7 +877,7 @@ def cmd_list(_args: argparse.Namespace) -> None:
             sys.exit("No nsec found and daemon not running.")
         vault = load_vault(keys)
         if not vault:
-            sys.exit("No avault.enc found.")
+            sys.exit("No secrets.vault found.")
         return {"ok": True, "data": {
             name: {
                 "keys": list(e.get("values", {}).keys()),
@@ -780,7 +911,7 @@ def cmd_get(args: argparse.Namespace) -> None:
             sys.exit("No nsec found and daemon not running.")
         vault = load_vault(keys)
         if not vault:
-            sys.exit("No avault.enc found.")
+            sys.exit("No secrets.vault found.")
         entry = vault["secrets"].get(args.name)
         if not entry:
             sys.exit(f'Secret "{args.name}" not found.')
@@ -814,7 +945,7 @@ def cmd_set(args: argparse.Namespace) -> None:
             sys.exit("No nsec found and daemon not running.")
         vault = load_vault(keys)
         if not vault:
-            sys.exit("No avault.enc found.")
+            sys.exit("No secrets.vault found.")
         if args.name not in vault["secrets"]:
             vault["secrets"][args.name] = {"values": {}, "added": today(), "rotated": today()}
         vault["secrets"][args.name]["values"][args.key] = args.value
@@ -838,7 +969,7 @@ def cmd_delete(args: argparse.Namespace) -> None:
             sys.exit("No nsec found and daemon not running.")
         vault = load_vault(keys)
         if not vault:
-            sys.exit("No avault.enc found.")
+            sys.exit("No secrets.vault found.")
         if args.name not in vault["secrets"]:
             sys.exit(f'Secret "{args.name}" not found.')
         del vault["secrets"][args.name]
@@ -856,7 +987,7 @@ def cmd_export(args: argparse.Namespace) -> None:
             sys.exit("No nsec found and daemon not running.")
         vault = load_vault(keys)
         if not vault:
-            sys.exit("No avault.enc found.")
+            sys.exit("No secrets.vault found.")
         all_vars = {}
         for entry in vault["secrets"].values():
             all_vars.update(entry.get("values", {}))
@@ -883,7 +1014,7 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         sys.exit("No nsec found.")
     vault = load_vault(keys)
     if not vault:
-        sys.exit("No avault.enc found. Run: avault init")
+        sys.exit("No secrets.vault found. Run: avault init")
 
     exports = parse_profile_exports()
     groups = group_exports(exports)
@@ -925,7 +1056,7 @@ def cmd_audit(_args: argparse.Namespace) -> None:
         sys.exit("No nsec found.")
     vault = load_vault(keys)
     if not vault:
-        sys.exit("No avault.enc found.")
+        sys.exit("No secrets.vault found.")
 
     vault_keys = set()
     for entry in vault["secrets"].values():
@@ -959,6 +1090,7 @@ def cmd_audit(_args: argparse.Namespace) -> None:
 
 def cmd_doctor(_args: argparse.Namespace) -> None:
     """Check prerequisites and config health."""
+    auto_migrate_layout()
     checks = []
 
     # 1. nostr-sdk importable
@@ -968,7 +1100,14 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
     except ImportError:
         checks.append({"check": "nostr-sdk", "ok": False, "detail": "pip install nostr-sdk"})
 
-    # 2. nsec available
+    # 2. .avault/ directory
+    checks.append({
+        "check": ".avault/",
+        "ok": AVAULT_DIR.is_dir(),
+        "detail": str(AVAULT_DIR) if AVAULT_DIR.is_dir() else "not found — run: avault init",
+    })
+
+    # 3. nsec available
     nsec = get_nsec_string()
     checks.append({
         "check": "nsec",
@@ -976,36 +1115,57 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
         "detail": "found in env/profile" if nsec else "not found (set NOSTR_NSEC or add to ~/.profile)",
     })
 
-    # 3. Vault file exists
+    # 4. secrets.vault exists
     checks.append({
-        "check": "avault.enc",
+        "check": "secrets.vault",
         "ok": VAULT_FILE.exists(),
         "detail": str(VAULT_FILE) if VAULT_FILE.exists() else "not found — run: avault init",
     })
 
-    # 4. nsec.enc exists
+    # 5. nsec.enc exists
     checks.append({
         "check": "nsec.enc",
         "ok": NSEC_ENC_FILE.exists(),
         "detail": str(NSEC_ENC_FILE) if NSEC_ENC_FILE.exists() else "not found — run: avault init",
     })
 
-    # 5. nip46.json exists and valid
-    nip46_ok = False
-    nip46_detail = "not found"
-    if NIP46_FILE.exists():
+    # 6. config.json exists and valid
+    config_ok = False
+    config_detail = "not found"
+    if CONFIG_FILE.exists():
         try:
-            cfg = json.loads(NIP46_FILE.read_text())
-            if cfg.get("signer_npub") and cfg.get("agent_npub"):
-                nip46_ok = True
-                nip46_detail = f"signer={cfg['signer_npub'][:20]}..."
+            cfg = json.loads(CONFIG_FILE.read_text())
+            if cfg.get("owner_npub") and cfg.get("agent_npub"):
+                config_ok = True
+                config_detail = f"owner={cfg['owner_npub'][:20]}..."
             else:
-                nip46_detail = "missing signer_npub or agent_npub"
+                config_detail = "missing owner_npub or agent_npub"
         except json.JSONDecodeError:
-            nip46_detail = "invalid JSON"
-    checks.append({"check": "nip46.json", "ok": nip46_ok, "detail": nip46_detail})
+            config_detail = "invalid JSON"
+    checks.append({"check": "config.json", "ok": config_ok, "detail": config_detail})
 
-    # 6. Vault decryptable (only if nsec + vault exist)
+    # 7. secrets.central exists
+    checks.append({
+        "check": "secrets.central",
+        "ok": CENTRAL_FILE.exists(),
+        "detail": str(CENTRAL_FILE) if CENTRAL_FILE.exists() else "not found",
+    })
+
+    # 8. relay configured (for NIP-46 fallback)
+    relay_ok = False
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            relay_ok = bool(cfg.get("relay"))
+        except Exception:
+            pass
+    checks.append({
+        "check": "relay",
+        "ok": relay_ok,
+        "detail": "configured" if relay_ok else "not configured (NIP-46 fallback won't work)",
+    })
+
+    # 9. Vault decryptable (only if nsec + vault exist)
     if nsec and VAULT_FILE.exists():
         try:
             keys = Keys.parse(nsec)
@@ -1023,7 +1183,7 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
     else:
         checks.append({"check": "vault_decrypt", "ok": False, "detail": "skipped (no nsec or vault)"})
 
-    # 7. Daemon running
+    # 10. Daemon running
     if daemon_running():
         resp = daemon_request({"cmd": "status"})
         checks.append({
@@ -1034,7 +1194,7 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
     else:
         checks.append({"check": "daemon", "ok": False, "detail": "not running"})
 
-    # 8. Git repo (for auto-commit)
+    # 11. Git repo (for auto-commit)
     git_ok = (WORKSPACE / ".git").is_dir()
     checks.append({
         "check": "git_repo",
@@ -1076,7 +1236,7 @@ def cmd_stale(args: argparse.Namespace) -> None:
             sys.exit("No nsec found and daemon not running.")
         vault = load_vault(keys)
         if not vault:
-            sys.exit("No avault.enc found.")
+            sys.exit("No secrets.vault found.")
         return {
             name: {
                 "keys": list(e.get("values", {}).keys()),
@@ -1125,6 +1285,84 @@ def cmd_stale(args: argparse.Namespace) -> None:
     output(result, human)
 
 
+def cmd_fleet_audit(args: argparse.Namespace) -> None:
+    """Decrypt secrets.central metadata with owner's nsec (no secret values)."""
+    owner_keys = Keys.parse(args.owner_nsec)
+    repo = Path(args.repo).resolve()
+    avault_dir = repo / ".avault"
+    config_file = avault_dir / "config.json"
+    central_file = avault_dir / "secrets.central"
+
+    if not config_file.exists():
+        sys.exit(f"No .avault/config.json in {repo}")
+    if not central_file.exists():
+        sys.exit(f"No .avault/secrets.central in {repo}")
+
+    config = json.loads(config_file.read_text())
+    agent_pk = PublicKey.parse(config["agent_npub"])
+
+    ciphertext = central_file.read_text().strip()
+    plaintext = nip44_decrypt(owner_keys.secret_key(), agent_pk, ciphertext)
+    manifest = json.loads(plaintext)
+
+    def human(m):
+        print(f"Agent: {config.get('agent_npub', '?')}")
+        print(f"Owner: {config.get('owner_npub', '?')}")
+        print()
+        for name, info in m.get("secrets", {}).items():
+            keys_str = ", ".join(info.get("keys", []))
+            print(f"  {name:<20} keys=[{keys_str}]  added={info.get('added','-')}  rotated={info.get('rotated','-')}")
+        if not m.get("secrets"):
+            print("  (no secrets)")
+
+    output(manifest, human)
+
+
+def cmd_fleet_recover(args: argparse.Namespace) -> None:
+    """Recover agent nsec and optionally full vault with owner's nsec."""
+    owner_keys = Keys.parse(args.owner_nsec)
+    repo = Path(args.repo).resolve()
+    avault_dir = repo / ".avault"
+    config_file = avault_dir / "config.json"
+    nsec_enc_file = avault_dir / "nsec.enc"
+    vault_file = avault_dir / "secrets.vault"
+
+    if not config_file.exists():
+        sys.exit(f"No .avault/config.json in {repo}")
+    if not nsec_enc_file.exists():
+        sys.exit(f"No .avault/nsec.enc in {repo}")
+
+    config = json.loads(config_file.read_text())
+    agent_pk = PublicKey.parse(config["agent_npub"])
+
+    # Decrypt agent nsec
+    nsec_ciphertext = nsec_enc_file.read_text().strip()
+    agent_nsec = nip44_decrypt(owner_keys.secret_key(), agent_pk, nsec_ciphertext)
+
+    result = {
+        "agent_npub": config["agent_npub"],
+        "agent_nsec": agent_nsec,
+    }
+
+    # Optionally decrypt full vault
+    if args.full and vault_file.exists():
+        agent_keys = Keys.parse(agent_nsec)
+        vault_ciphertext = vault_file.read_text().strip()
+        vault_plaintext = nip44_decrypt(agent_keys.secret_key(), agent_keys.public_key(), vault_ciphertext)
+        result["vault"] = json.loads(vault_plaintext)
+
+    def human(r):
+        print(f"Agent npub: {r['agent_npub']}")
+        print(f"Agent nsec: {r['agent_nsec']}")
+        if "vault" in r:
+            print(f"\nVault ({len(r['vault'].get('secrets', {}))} secrets):")
+            for name, entry in r["vault"].get("secrets", {}).items():
+                for k, v in entry.get("values", {}).items():
+                    print(f"  {name}.{k} = {v}")
+
+    output(result, human)
+
+
 # --- CLI ---
 
 def main():
@@ -1150,7 +1388,7 @@ def main():
 
     # init
     p_init = sub.add_parser("init", help="Initialize vault")
-    p_init.add_argument("--signer-npub", required=True, help="Operator's npub")
+    p_init.add_argument("--owner-npub", required=True, help="Owner's npub (IT fleet key or operator)")
     p_init.add_argument("--agent-name", default="avault", help="Agent name shown in signer (default: avault)")
 
     # unlock
@@ -1193,6 +1431,17 @@ def main():
     p_stale = sub.add_parser("stale", help="Flag secrets not rotated recently")
     p_stale.add_argument("--days", type=int, default=90, help="Staleness threshold in days (default: 90)")
 
+    # fleet-audit
+    p_faudit = sub.add_parser("fleet-audit", help="Decrypt secrets.central metadata (owner-side)")
+    p_faudit.add_argument("--owner-nsec", required=True, help="Owner's nsec for decryption")
+    p_faudit.add_argument("--repo", default=".", help="Path to workspace (default: .)")
+
+    # fleet-recover
+    p_frecover = sub.add_parser("fleet-recover", help="Recover agent nsec + vault (owner-side)")
+    p_frecover.add_argument("--owner-nsec", required=True, help="Owner's nsec for decryption")
+    p_frecover.add_argument("--repo", default=".", help="Path to workspace (default: .)")
+    p_frecover.add_argument("--full", action="store_true", help="Also decrypt full vault secrets")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -1205,6 +1454,10 @@ def main():
     # Handle --background flag for daemon start
     if args.command == "daemon" and getattr(args, "background", False):
         args.foreground = False
+
+    # Auto-migrate old flat-file layout (skip for init/fleet commands)
+    if args.command not in ("init", "fleet-audit", "fleet-recover"):
+        auto_migrate_layout()
 
     commands = {
         "daemon": cmd_daemon,
@@ -1219,6 +1472,8 @@ def main():
         "audit": cmd_audit,
         "doctor": cmd_doctor,
         "stale": cmd_stale,
+        "fleet-audit": cmd_fleet_audit,
+        "fleet-recover": cmd_fleet_recover,
     }
     commands[args.command](args)
 
